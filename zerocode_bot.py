@@ -2117,13 +2117,12 @@ async def join_command(
 
     target_channel = interaction.user.voice.channel
     guild = interaction.guild
-
-        try:
+    try:
         apply_voice_recv_patch()
         current_vc = guild.voice_client if guild else None
         if isinstance(current_vc, voice_recv.VoiceRecvClient) and current_vc.is_connected():
             if current_vc.channel != target_channel:
-                await current_vc.move_to(target_channel)
+               await current_vc.move_to(target_channel)
             current_vc.listen(GuildVoiceSink(current_vc, asyncio.get_running_loop()))
         else:
             if current_vc and current_vc.is_connected():
