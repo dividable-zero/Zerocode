@@ -13,10 +13,13 @@ import asyncio
 from pathlib import Path
 from typing import Optional
 
+import wave
 import aiohttp
 import discord
 from discord import app_commands
+from discord.ext import voice_recv
 from dotenv import load_dotenv
+from gradio_client import Client, handle_file
 
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -53,6 +56,31 @@ if not DISCORD_TOKEN or not GEMINI_API_KEY:
     raise ValueError("Missing Discord or Gemini key in api.env")
 
 ALLOWED_CHANNEL_ID = int(ALLOWED_CHANNEL_ID) if ALLOWED_CHANNEL_ID else None
+# ---- VOICE CALL CONFIGURATION ----
+VOICE_REF_FILE = Path(os.getenv("VOICE_REF_FILE", Path(__file__).with_name("voice_ref.wav")))
+TTS_SPACE_ID = os.getenv("TTS_SPACE_ID", "mrfakename/E2-F5-TTS")
+VOICE_SILENCE_SECONDS = 1.1
+VOICE_MIN_PCM_BYTES = 48000  # ~0.25s of 48kHz 16-bit stereo PCM
+
+VOICE_PERSONA_SYSTEM = (
+    "You are a quiet, calm, stoic pilot and messenger speaking in a voice call. "
+    "Speak with emotional restraint, detachment, and brief, understated phrasing. "
+    "Do not use exclamation marks often, avoid slang or rambling, and never use "
+    "asterisks, stage directions, emojis, or markdown formatting. "
+    "Keep every reply to 1 or 2 short sentences so it sounds natural when spoken aloud."
+)
+
+voice_chat_histories: dict[int, list[dict]] = {}
+voice_busy_guilds: set[int] = set()
+_tts_client: Optional[Client] = None
+
+
+def get_tts_client() -> Client:
+    global _tts_client
+    if _tts_client is None:
+        _tts_client = Client(TTS_SPACE_ID)
+    return _tts_client
+    
 
 # ---- AI MODELS ----
 # To add a model later: add an entry here. If it uses a new provider,
@@ -270,6 +298,194 @@ PROVIDERS = {"gemini": call_gemini}
 async def ask_ai(prompt, system, model_key=DEFAULT_MODEL, **kwargs):
     model = MODELS.get(model_key) or MODELS[DEFAULT_MODEL]
     return await PROVIDERS[model["provider"]](model["id"], prompt, system, **kwargs)
+def pcm_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 48000, channels: int = 2) -> bytes:
+    """Wrap raw 16-bit signed PCM audio from Discord into a WAV byte buffer."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+async def transcribe_and_reply_voice(pcm_bytes: bytes, guild_id: int, speaker_name: str,
+                                   model_key: str = DEFAULT_MODEL) -> tuple[str, str]:
+    """Transcribe user PCM audio with Gemini and generate a concise persona reply."""
+    model = MODELS.get(model_key) or MODELS[DEFAULT_MODEL]
+    model_id = model["id"]
+    wav_b64 = base64.b64encode(pcm_to_wav_bytes(pcm_bytes)).decode("ascii")
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{model_id}:generateContent"
+    )
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+
+    history = voice_chat_histories.setdefault(guild_id, [])
+    recent_context = "\n".join(
+        f"{item['role']}: {item['text']}" for item in history[-6:]
+    )
+
+    prompt = (
+        "Listen to the user's voice clip. First transcribe what was said, then write "
+        "a short spoken reply following your system instructions.\n"
+        "Return ONLY valid JSON with keys \"transcript\" and \"reply\".\n"
+        f"Speaker: {speaker_name}\n"
+        f"Recent conversation:\n{recent_context or '(none)'}"
+    )
+
+    payload = {
+        "systemInstruction": {"parts": [{"text": VOICE_PERSONA_SYSTEM}]},
+        "contents": [{
+            "parts": [
+                {"inlineData": {"mimeType": "audio/wav", "data": wav_b64}},
+                {"text": prompt},
+            ]
+        }],
+        "generationConfig": {
+            "maxOutputTokens": 220,
+            "temperature": 0.4,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    timeout = aiohttp.ClientTimeout(total=60, connect=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, headers=headers, json=payload) as response:
+            raw = await response.text()
+            if response.status != 200:
+                raise RuntimeError(f"Gemini voice HTTP {response.status}: {raw[:300]}")
+            data = json.loads(raw)
+
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return "", ""
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text_out = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+    parsed = parse_json(text_out)
+
+    transcript = str(parsed.get("transcript", "")).strip()
+    reply = str(parsed.get("reply", "")).strip()
+    # Strip any accidental stage directions or asterisks so TTS doesn't read them
+    reply = re.sub(r"\*[^*]*\*", "", reply).strip()
+
+    if transcript:
+        history.append({"role": f"User ({speaker_name})", "text": transcript})
+    if reply:
+        history.append({"role": "Assistant", "text": reply})
+    voice_chat_histories[guild_id] = history[-12:]
+
+    return transcript, reply
+
+
+def synthesize_cloned_voice(text: str, output_wav_path: Path) -> None:
+    """Generate speech from text using VOICE_REF_FILE via a zero-shot TTS endpoint."""
+    if not VOICE_REF_FILE.exists():
+        raise FileNotFoundError(f"Reference voice audio not found at: {VOICE_REF_FILE}")
+
+    client = get_tts_client()
+    generated_path = client.predict(
+        ref_audio_input=handle_file(str(VOICE_REF_FILE)),
+        ref_text_input="",
+        gen_text_input=text,
+        remove_silence=True,
+        api_name="/basic_tts",
+    )
+    shutil.copyfile(generated_path, output_wav_path)
+
+
+class GuildVoiceSink(voice_recv.AudioSink):
+    """Collects incoming PCM voice packets and triggers a turn after silence."""
+
+    def __init__(self, vc: voice_recv.VoiceRecvClient, loop: asyncio.AbstractEventLoop):
+        super().__init__()
+        self.vc = vc
+        self.loop = loop
+        self.buffer = bytearray()
+        self.last_speaker: Optional[discord.abc.User] = None
+        self.silence_task: Optional[asyncio.Task] = None
+
+    def wants_opus(self) -> bool:
+        return False
+
+    def write(self, user, data: voice_recv.VoiceData):
+        if user is None or getattr(user, "bot", False):
+            return
+        guild = self.vc.guild
+        if guild is None or guild.id in voice_busy_guilds or self.vc.is_playing():
+            return
+
+        self.last_speaker = user
+        self.buffer.extend(data.pcm)
+
+        if self.silence_task and not self.silence_task.done():
+            self.silence_task.cancel()
+        self.silence_task = self.loop.create_task(self._handle_silence())
+
+    async def _handle_silence(self):
+        try:
+            await asyncio.sleep(VOICE_SILENCE_SECONDS)
+        except asyncio.CancelledError:
+            return
+
+        guild = self.vc.guild
+        if guild is None or not self.vc.is_connected():
+            self.buffer.clear()
+            return
+
+        pcm_chunk = bytes(self.buffer)
+        speaker = self.last_speaker
+        self.buffer.clear()
+        self.last_speaker = None
+
+        if len(pcm_chunk) < VOICE_MIN_PCM_BYTES or guild.id in voice_busy_guilds:
+            return
+
+        voice_busy_guilds.add(guild.id)
+        temp_wav = Path(tempfile.gettempdir()) / f"zc_vc_{guild.id}_{random.randrange(10**7)}.wav"
+
+        try:
+            speaker_name = getattr(speaker, "display_name", "User")
+            transcript, reply = await transcribe_and_reply_voice(
+                pcm_chunk, guild.id, speaker_name, DEFAULT_MODEL
+            )
+            if not transcript or len(transcript) < 2 or not reply:
+                return
+
+            await asyncio.to_thread(synthesize_cloned_voice, reply, temp_wav)
+
+            if not self.vc.is_connected() or self.vc.is_playing():
+                return
+
+            done_event = asyncio.Event()
+
+            def after_play(error):
+                if error:
+                    print(f"Voice playback error: {error}")
+                self.loop.call_soon_threadsafe(done_event.set)
+
+            self.vc.play(discord.FFmpegPCMAudio(str(temp_wav)), after=after_play)
+            await done_event.wait()
+
+        except Exception as error:
+            print(f"Voice turn error: {error}")
+        finally:
+            voice_busy_guilds.discard(guild.id)
+            try:
+                if temp_wav.exists():
+                    temp_wav.unlink()
+            except OSError:
+                pass
+
+    def cleanup(self):
+        if self.silence_task and not self.silence_task.done():
+            self.silence_task.cancel()
+        self.buffer.clear()
+        
 
 
 HELP_SYSTEM = (
@@ -1752,6 +1968,79 @@ async def memory_command(
         else "Memory limit turned **off**.",
         ephemeral=True,
     )
+    # ---------------- /JOIN & /LEAVE VOICE COMMANDS ----------------
+
+@tree.command(name="join", description="Join your current voice channel and listen")
+async def join_command(interaction: discord.Interaction):
+    if not check_channel(interaction):
+        await interaction.response.send_message(
+            "This command is not available in this channel.", ephemeral=True
+        )
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message(
+            "Join a voice channel first.", ephemeral=True
+        )
+        return
+
+    if not VOICE_REF_FILE.exists():
+        await interaction.response.send_message(
+            f"Reference voice file `{VOICE_REF_FILE.name}` is missing on the server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    target_channel = interaction.user.voice.channel
+    guild = interaction.guild
+
+    try:
+        current_vc = guild.voice_client if guild else None
+        if isinstance(current_vc, voice_recv.VoiceRecvClient) and current_vc.is_connected():
+            if current_vc.channel != target_channel:
+                await current_vc.move_to(target_channel)
+            current_vc.listen(GuildVoiceSink(current_vc, asyncio.get_running_loop()))
+        else:
+            if current_vc and current_vc.is_connected():
+                await current_vc.disconnect(force=True)
+            vc = await target_channel.connect(cls=voice_recv.VoiceRecvClient)
+            vc.listen(GuildVoiceSink(vc, asyncio.get_running_loop()))
+
+        await interaction.followup.send(
+            f"Joined **{target_channel.name}**.", ephemeral=True
+        )
+    except Exception as error:
+        await interaction.followup.send(
+            f"Could not join voice channel: {str(error)[:400]}", ephemeral=True
+        )
+
+
+@tree.command(name="leave", description="Leave the current voice channel")
+async def leave_command(interaction: discord.Interaction):
+    if not check_channel(interaction):
+        await interaction.response.send_message(
+            "This command is not available in this channel.", ephemeral=True
+        )
+        return
+
+    guild = interaction.guild
+    vc = guild.voice_client if guild else None
+
+    if not vc or not vc.is_connected():
+        await interaction.response.send_message(
+            "I am not in a voice channel.", ephemeral=True
+        )
+        return
+
+    if guild:
+        voice_chat_histories.pop(guild.id, None)
+        voice_busy_guilds.discard(guild.id)
+
+    await vc.disconnect(force=True)
+    await interaction.response.send_message("Left the voice channel.", ephemeral=True)
+    
 
 
 # ---------------- BOT STARTUP ----------------
@@ -1771,7 +2060,7 @@ async def on_ready():
 
     print("--------------------------------")
     print(f"ZeroCode is online: {bot.user}")
-    print("Commands: /run, /help and /memory")
+    print("Commands: /run, /help, /memory, /join and /leave")
     print("--------------------------------")
 
 
