@@ -2123,14 +2123,13 @@ async def join_command(
         current_vc = guild.voice_client if guild else None
         if isinstance(current_vc, voice_recv.VoiceRecvClient) and current_vc.is_connected():
             if current_vc.channel != target_channel:
-            await current_vc.move_to(target_channel)
+                await current_vc.move_to(target_channel)
             current_vc.listen(GuildVoiceSink(current_vc, asyncio.get_running_loop()))
         else:
             if current_vc and current_vc.is_connected():
                 await current_vc.disconnect(force=True)
             vc = await target_channel.connect(cls=voice_recv.VoiceRecvClient)
             vc.listen(GuildVoiceSink(vc, asyncio.get_running_loop()))
-
 
         await interaction.followup.send(
             f"Joined **{target_channel.name}**.", ephemeral=True
@@ -2139,6 +2138,7 @@ async def join_command(
         await interaction.followup.send(
             f"Could not join voice channel: {str(error)[:400]}", ephemeral=True
         )
+        
         
 
 
