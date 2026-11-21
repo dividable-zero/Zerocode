@@ -1,5 +1,9 @@
+import logging
 import discord
+import davey
 from discord.ext.voice_recv import opus as _vr_opus
+
+log = logging.getLogger("zerocode.dave_patch")
 
 
 def apply_voice_recv_patch() -> None:
@@ -22,11 +26,15 @@ def apply_voice_recv_patch() -> None:
                 user_id = getattr(user, "id", None)
                 if user_id is not None:
                     try:
-                        decrypted = dave_session.decrypt(user_id, bytes(packet.decrypted_data))
+                        decrypted = dave_session.decrypt(
+                            int(user_id),
+                            davey.MediaType.audio,
+                            bytes(packet.decrypted_data),
+                        )
                         if decrypted:
                             packet.decrypted_data = decrypted
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.warning("DAVE decrypt failed for user %s: %s", user_id, exc)
 
         try:
             return _orig_decode_packet(self, packet)
@@ -35,3 +43,4 @@ def apply_voice_recv_patch() -> None:
 
     _vr_opus.PacketDecoder._decode_packet = _safe_decode_packet
     _vr_opus.PacketDecoder._zc_patched = True
+    log.info("Applied DAVE E2EE voice receive patch.")
