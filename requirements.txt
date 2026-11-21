@@ -1,4 +1,8 @@
 discord.py
+PyNaCl
+discord-ext-voice-recv
+gradio_client
 aiohttp
 python-dotenv
 google-genai
+yt-dlp
