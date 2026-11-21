@@ -58,6 +58,7 @@ if not DISCORD_TOKEN or not GEMINI_API_KEY:
 ALLOWED_CHANNEL_ID = int(ALLOWED_CHANNEL_ID) if ALLOWED_CHANNEL_ID else None
 # ---- VOICE CALL CONFIGURATION ----
 VOICE_REF_FILE = Path(os.getenv("VOICE_REF_FILE", Path(__file__).with_name("voice_ref.wav")))
+VOICE_REF_URL = os.getenv("VOICE_REF_URL", "").strip()
 TTS_SPACE_ID = os.getenv("TTS_SPACE_ID", "mrfakename/E2-F5-TTS")
 VOICE_SILENCE_SECONDS = 1.1
 VOICE_MIN_PCM_BYTES = 48000  # ~0.25s of 48kHz 16-bit stereo PCM
@@ -380,7 +381,68 @@ async def transcribe_and_reply_voice(pcm_bytes: bytes, guild_id: int, speaker_na
     voice_chat_histories[guild_id] = history[-12:]
 
     return transcript, reply
+def normalize_gdrive_url(url: str) -> str:
+    """Convert a standard Google Drive share URL into a direct download URL."""
+    match = re.search(r"drive\.google\.com/(?:file/d/|open\?id=)([A-Za-z0-9_-]+)", url)
+    if match:
+        return f"https://drive.google.com/uc?export=download&id={match.group(1)}"
+    return url
 
+
+async def prepare_reference_audio(
+    url: str,
+    target_wav: Path = VOICE_REF_FILE,
+    start_sec: Optional[float] = None,
+    duration_sec: Optional[float] = None,
+) -> None:
+    """Download audio from Google Drive, YouTube, or direct media URL and convert to WAV."""
+    clean_url = normalize_gdrive_url(url.strip())
+
+    with tempfile.TemporaryDirectory(prefix="zc_ref_") as tmp:
+        raw_download = Path(tmp) / "source_media"
+
+        if "drive.google.com" in clean_url or clean_url.lower().endswith(
+            (".wav", ".mp3", ".ogg", ".m4a", ".mp4", ".webm")
+        ):
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(clean_url) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"Could not download reference link (HTTP {resp.status}).")
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "text/html" in content_type and "drive.google.com" in clean_url:
+                        raise RuntimeError(
+                            "Google Drive returned a webpage instead of audio. "
+                            "Make sure sharing is set to 'Anyone with the link'."
+                        )
+                    raw_download.write_bytes(await resp.read())
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                "yt-dlp", "-f", "bestaudio/best", "-o", str(raw_download), clean_url,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+            if proc.returncode != 0 or not raw_download.exists():
+                raise RuntimeError(f"yt-dlp failed: {err.decode('utf-8', errors='replace')[:300]}")
+
+        ff_args = ["ffmpeg", "-y"]
+        if start_sec is not None and start_sec >= 0:
+            ff_args.extend(["-ss", str(start_sec)])
+        ff_args.extend(["-i", str(raw_download)])
+        if duration_sec is not None and duration_sec > 0:
+            ff_args.extend(["-t", str(duration_sec)])
+        ff_args.extend(["-ac", "1", "-ar", "24000", str(target_wav)])
+
+        ff = await asyncio.create_subprocess_exec(
+            *ff_args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, ff_err = await asyncio.wait_for(ff.communicate(), timeout=30)
+        if ff.returncode != 0 or not target_wav.exists():
+            raise RuntimeError(f"FFmpeg conversion failed: {ff_err.decode('utf-8', errors='replace')[:300]}")
+                
 
 def synthesize_cloned_voice(text: str, output_wav_path: Path) -> None:
     """Generate speech from text using VOICE_REF_FILE via a zero-shot TTS endpoint."""
@@ -1971,7 +2033,17 @@ async def memory_command(
     # ---------------- /JOIN & /LEAVE VOICE COMMANDS ----------------
 
 @tree.command(name="join", description="Join your current voice channel and listen")
-async def join_command(interaction: discord.Interaction):
+@app_commands.describe(
+    voice_url="Google Drive, YouTube, or direct audio/video link for the voice",
+    start_sec="Optional start time in seconds (e.g. 12.5) if trimming on the server",
+    duration_sec="Optional length in seconds (e.g. 10) if trimming on the server",
+)
+async def join_command(
+    interaction: discord.Interaction,
+    voice_url: Optional[str] = None,
+    start_sec: Optional[float] = None,
+    duration_sec: Optional[float] = None,
+):
     if not check_channel(interaction):
         await interaction.response.send_message(
             "This command is not available in this channel.", ephemeral=True
@@ -1984,14 +2056,27 @@ async def join_command(interaction: discord.Interaction):
         )
         return
 
+    await interaction.response.defer(ephemeral=True)
+
+    source_url = (voice_url or VOICE_REF_URL).strip()
+    if source_url:
+        try:
+            await prepare_reference_audio(
+                source_url, VOICE_REF_FILE, start_sec=start_sec, duration_sec=duration_sec
+            )
+        except Exception as error:
+            await interaction.followup.send(
+                f"Failed to load reference voice from link: {str(error)[:400]}",
+                ephemeral=True,
+            )
+            return
+
     if not VOICE_REF_FILE.exists():
-        await interaction.response.send_message(
-            f"Reference voice file `{VOICE_REF_FILE.name}` is missing on the server.",
+        await interaction.followup.send(
+            "No reference voice available. Provide a `voice_url` in `/join` or set `VOICE_REF_URL` in `api.env`.",
             ephemeral=True,
         )
         return
-
-    await interaction.response.defer(ephemeral=True)
 
     target_channel = interaction.user.voice.channel
     guild = interaction.guild
@@ -2015,6 +2100,7 @@ async def join_command(interaction: discord.Interaction):
         await interaction.followup.send(
             f"Could not join voice channel: {str(error)[:400]}", ephemeral=True
         )
+        
 
 
 @tree.command(name="leave", description="Leave the current voice channel")
