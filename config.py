@@ -25,10 +25,10 @@ if not DISCORD_TOKEN or not GEMINI_API_KEY:
 _channel_raw = os.getenv("ALLOWED_CHANNEL_ID", "").strip()
 ALLOWED_CHANNEL_ID = int(_channel_raw) if _channel_raw.isdigit() else None
 
-DEFAULT_MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 MODELS = {
     "default": {"label": "Gemini Default", "id": DEFAULT_MODEL_ID},
-    "flash-lite": {"label": "Gemini Flash Lite", "id": "gemini-2.5-flash-lite"},
+    "flash-lite": {"label": "Gemini Flash Lite", "id": "gemini-3.8-flash-lite"},
 }
 
 VOICE_REF_FILE = Path(os.getenv("VOICE_REF_FILE", BASE_DIR / "voice_ref.wav"))
