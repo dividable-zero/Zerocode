@@ -21,7 +21,7 @@ def get_tts_client() -> Client:
 def normalize_gdrive_url(url: str) -> str:
     match = re.search(r"drive\.google\.com/(?:file/d/|open\?id=)([A-Za-z0-9_-]+)", url)
     if match:
-        return f"[https://drive.google.com/uc?export=download&id=](https://drive.google.com/uc?export=download&id=){match.group(1)}"
+        return f"https://drive.google.com/uc?export=download&id={match.group(1)}"
     return url
 
 

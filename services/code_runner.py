@@ -17,7 +17,7 @@ DIAG_SYSTEM = (
 async def get_compilers(session: aiohttp.ClientSession):
     global _compiler_cache
     if _compiler_cache is None:
-        async with session.get("[https://wandbox.org/api/list.json](https://wandbox.org/api/list.json)") as resp:
+        async with session.get("https://wandbox.org/api/list.json") as resp:
             if resp.status != 200:
                 raise RuntimeError("Could not reach Wandbox compiler service.")
             _compiler_cache = await resp.json()
@@ -50,7 +50,7 @@ async def compile_code(language: str, code: str, stdin: str = "", memory_mb: int
             started = time.perf_counter()
 
             async with session.post(
-                "[https://wandbox.org/api/compile.json](https://wandbox.org/api/compile.json)",
+                "https://wandbox.org/api/compile.json",
                 json=payload,
                 headers={"Accept": "application/json"},
             ) as resp:

@@ -38,7 +38,7 @@ async def ask_gemini(
     temperature: float = 0.3,
 ) -> str:
     model_id = (MODELS.get(model_key) or MODELS["default"])["id"]
-    url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model_id}:generateContent"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
 
     gen_config = {"maxOutputTokens": max_tokens, "temperature": temperature}
@@ -101,7 +101,7 @@ async def transcribe_and_reply_voice(
 ) -> tuple[str, str]:
     model_id = (MODELS.get(model_key) or MODELS["default"])["id"]
     wav_b64 = base64.b64encode(pcm_to_wav_bytes(pcm_bytes)).decode("ascii")
-    url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model_id}:generateContent"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
 
     history = voice_chat_histories.setdefault(guild_id, [])
