@@ -1,3 +1,13 @@
+import logging, sys
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+for _mod in ("discord.ext.voice_recv", "discord.voice_state", "discord.player", "discord.opus"):
+    logging.getLogger(_mod).setLevel(logging.DEBUG)
+
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
